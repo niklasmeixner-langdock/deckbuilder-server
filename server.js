@@ -21,76 +21,96 @@ wss.on('connection', (ws) => {
   ws.on('error', () => clients.delete(ws));
 });
 
-// One MCP server instance, sessions keyed by id
-const mcp = new McpServer({ name: 'deckbuilder', version: '1.0.0' });
-const transports = {};
+// sessions: id -> { server, transport }
+const sessions = {};
 
-mcp.tool(
-  'build_deck',
-  'Build a branded Figma presentation deck. Pushes the spec to the connected Figma plugin.',
-  {
-    spec: z.object({
-      pageName: z.string(),
-      common: z.object({ presentationTitle: z.string() }).optional(),
-      slides: z.array(z.object({}).passthrough())
-    }).passthrough()
-  },
-  async ({ spec }) => {
-    if (clients.size === 0) {
+function createSession() {
+  const server = new McpServer({ name: 'deckbuilder', version: '1.0.0' });
+
+  server.tool(
+    'build_deck',
+    'Build a branded Figma presentation deck. Pushes the spec to the connected Figma plugin.',
+    {
+      spec: z.object({
+        pageName: z.string(),
+        common: z.object({ presentationTitle: z.string() }).optional(),
+        slides: z.array(z.object({}).passthrough())
+      }).passthrough()
+    },
+    async ({ spec }) => {
+      if (clients.size === 0) {
+        return {
+          content: [{ type: 'text', text: 'No Figma plugin connected. Open Figma and run the Deck Builder plugin first.' }],
+          isError: true
+        };
+      }
+      const payload = JSON.stringify({ type: 'build', spec });
+      let sent = 0;
+      for (const client of clients) {
+        try { client.send(payload); sent++; }
+        catch { clients.delete(client); }
+      }
+      console.log(`Dispatched to ${sent} client(s): ${spec.pageName}`);
       return {
-        content: [{ type: 'text', text: 'No Figma plugin connected. Open Figma and run the Deck Builder plugin first.' }],
-        isError: true
+        content: [{ type: 'text', text: `Building "${spec.pageName}" — sent to ${sent} Figma client(s).` }]
       };
     }
-    const payload = JSON.stringify({ type: 'build', spec });
-    let sent = 0;
-    for (const client of clients) {
-      try { client.send(payload); sent++; }
-      catch { clients.delete(client); }
-    }
-    console.log(`Dispatched to ${sent} client(s): ${spec.pageName}`);
-    return {
-      content: [{ type: 'text', text: `Building "${spec.pageName}" — sent to ${sent} Figma client(s).` }]
-    };
-  }
-);
+  );
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (id) => { sessions[id] = { server, transport }; }
+  });
+  transport.onclose = () => {
+    if (transport.sessionId) delete sessions[transport.sessionId];
+  };
+
+  return { server, transport };
+}
 
 app.get('/', (req, res) => res.json({ ok: true, clients: clients.size }));
 
 app.post('/mcp', async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'];
-  let transport = transports[sessionId];
+  try {
+    const sessionId = req.headers['mcp-session-id'];
+    const existing = sessions[sessionId];
 
-  if (!transport) {
+    if (existing) {
+      await existing.transport.handleRequest(req, res, req.body);
+      return;
+    }
+
     if (!req.body || req.body.method !== 'initialize') {
       res.status(400).json({ error: 'No session — send initialize first' });
       return;
     }
-    transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      onsessioninitialized: (id) => { transports[id] = transport; }
-    });
-    transport.onclose = () => {
-      if (transport.sessionId) delete transports[transport.sessionId];
-    };
-    await mcp.connect(transport);
-  }
 
-  await transport.handleRequest(req, res, req.body);
+    const { server, transport } = createSession();
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error('MCP POST error:', err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/mcp', async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'];
-  const transport = transports[sessionId];
-  if (!transport) { res.status(400).json({ error: 'Unknown session' }); return; }
-  await transport.handleRequest(req, res);
+  try {
+    const sessionId = req.headers['mcp-session-id'];
+    const existing = sessions[sessionId];
+    if (!existing) { res.status(400).json({ error: 'Unknown session' }); return; }
+    await existing.transport.handleRequest(req, res);
+  } catch (err) {
+    console.error('MCP GET error:', err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
 });
 
 app.delete('/mcp', async (req, res) => {
   const sessionId = req.headers['mcp-session-id'];
-  if (transports[sessionId]) {
-    await transports[sessionId].close();
-    delete transports[sessionId];
+  if (sessions[sessionId]) {
+    await sessions[sessionId].transport.close();
+    delete sessions[sessionId];
   }
   res.status(200).end();
 });
