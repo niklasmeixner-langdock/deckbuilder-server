@@ -4,7 +4,6 @@ import http from 'http';
 import { WebSocketServer } from 'ws';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 
 const app = express();
@@ -63,7 +62,7 @@ app.post('/mcp', async (req, res) => {
   let transport = transports[sessionId];
 
   if (!transport) {
-    if (!isInitializeRequest(req.body)) {
+    if (!req.body || req.body.method !== 'initialize') {
       res.status(400).json({ error: 'No session — send initialize first' });
       return;
     }
