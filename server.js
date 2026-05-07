@@ -1,73 +1,72 @@
-const express = require('express');
-const http = require('http');
-const { WebSocketServer } = require('ws');
+import express from 'express';
+import http from 'http';
+import { WebSocketServer } from 'ws';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { z } from 'zod';
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
-
-const API_KEY = process.env.API_KEY || 'changeme';
-
-// Track connected plugin clients
+const httpServer = http.createServer(app);
+const wss = new WebSocketServer({ server: httpServer });
 const clients = new Set();
 
 wss.on('connection', (ws) => {
   clients.add(ws);
-  console.log(`Plugin connected. Total clients: ${clients.size}`);
-
-  ws.on('close', () => {
-    clients.delete(ws);
-    console.log(`Plugin disconnected. Total clients: ${clients.size}`);
-  });
-
-  ws.on('error', (err) => {
-    console.error('WebSocket error:', err.message);
-    clients.delete(ws);
-  });
-
-  // Send a hello so the plugin knows it's live
-  ws.send(JSON.stringify({ type: 'connected', message: 'Langdock Deck Builder server ready.' }));
+  console.log(`Plugin connected. Total: ${clients.size}`);
+  ws.send(JSON.stringify({ type: 'connected', message: 'Deck Builder ready.' }));
+  ws.on('close', () => clients.delete(ws));
+  ws.on('error', () => clients.delete(ws));
 });
 
-// Health check
-app.get('/', (req, res) => {
-  res.json({ ok: true, clients: clients.size });
-});
+const mcp = new McpServer({ name: 'deckbuilder', version: '1.0.0' });
 
-// Langdock calls this with the deck spec JSON
-app.post('/spec', (req, res) => {
-  const key = req.headers['x-api-key'];
-  if (key !== API_KEY) {
-    return res.status(401).json({ error: 'Invalid API key' });
-  }
-
-  const spec = req.body;
-  if (!spec || !spec.pageName || !Array.isArray(spec.slides)) {
-    return res.status(400).json({ error: 'Invalid spec — must have pageName and slides[]' });
-  }
-
-  if (clients.size === 0) {
-    return res.status(503).json({ error: 'No plugin clients connected. Open Figma and run the plugin first.' });
-  }
-
-  const payload = JSON.stringify({ type: 'build', spec });
-  let sent = 0;
-  for (const client of clients) {
-    try {
-      client.send(payload);
-      sent++;
-    } catch (e) {
-      clients.delete(client);
+mcp.tool(
+  'build_deck',
+  'Build a branded Figma presentation deck. Pushes the spec to the connected Figma plugin, which clones master frames and applies all text, image, and SVG updates.',
+  {
+    spec: z.object({
+      pageName: z.string().describe('Name of the Figma page to create, e.g. "Deck: Acme Corp"'),
+      common: z.object({ presentationTitle: z.string() }).optional(),
+      slides: z.array(z.object({}).passthrough()).describe('Array of slide specs')
+    }).passthrough()
+  },
+  async ({ spec }) => {
+    if (clients.size === 0) {
+      return {
+        content: [{ type: 'text', text: 'No Figma plugin connected. Open Figma and run the Deck Builder plugin first.' }],
+        isError: true
+      };
     }
+    const payload = JSON.stringify({ type: 'build', spec });
+    let sent = 0;
+    for (const client of clients) {
+      try { client.send(payload); sent++; }
+      catch { clients.delete(client); }
+    }
+    console.log(`Spec dispatched to ${sent} client(s): ${spec.pageName}`);
+    return {
+      content: [{ type: 'text', text: `Building "${spec.pageName}" — dispatched to ${sent} Figma client(s).` }]
+    };
   }
+);
 
-  console.log(`Spec dispatched to ${sent} client(s): ${spec.pageName}`);
-  res.json({ ok: true, clientsNotified: sent });
+app.get('/', (req, res) => res.json({ ok: true, clients: clients.size }));
+
+app.post('/mcp', async (req, res) => {
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  res.on('close', () => transport.close());
+  await mcp.connect(transport);
+  await transport.handleRequest(req, res, req.body);
+});
+
+app.get('/mcp', async (req, res) => {
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  res.on('close', () => transport.close());
+  await mcp.connect(transport);
+  await transport.handleRequest(req, res);
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Deck Builder server listening on port ${PORT}`);
-});
+httpServer.listen(PORT, () => console.log(`Deck Builder MCP server on port ${PORT}`));
